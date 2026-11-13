@@ -38,7 +38,7 @@ NOVNC_COMPRESSION="${NOVNC_COMPRESSION:-4}"
 CF_TOKEN="${CF_TOKEN:-}"
 VERBOSE="${VERBOSE:-0}"
 
-RD_USER="${RD_USER:-remote}"
+RD_USER="${RD_USER:-QuocAnk}"
 RD_USER_PASSWORD="${RD_USER_PASSWORD:-quocanhh}"
 
 log() { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
