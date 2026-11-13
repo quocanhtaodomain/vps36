@@ -38,7 +38,7 @@ NOVNC_COMPRESSION="${NOVNC_COMPRESSION:-4}"
 CF_TOKEN="${CF_TOKEN:-}"
 VERBOSE="${VERBOSE:-0}"
 
-RD_USER="${RD_USER:-QuocAnk}"
+RD_USER="${RD_USER:-remote}"
 RD_USER_PASSWORD="${RD_USER_PASSWORD:-quocanhh}"
 
 log() { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
@@ -510,7 +510,11 @@ start_all() {
 
   # 1) X server (TigerVNC) - chỉ lắng nghe localhost, tối ưu cập nhật khung hình
   #    env -u LD_LIBRARY_PATH: tránh nạp nhầm EGL của NVIDIA (gây segfault trên Colab)
-  svc_start xvnc env -u LD_LIBRARY_PATH Xtigervnc ":${DISP_NUM}" \
+  #    Chỉ cho Xtigervnc thấy EGL của Mesa (EGL của NVIDIA làm swrast crash khi khởi tạo GLX);
+  #    ứng dụng chạy bằng gpurun vẫn dùng NVIDIA bình thường.
+  local egl_env="__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json"
+  [ -e /usr/share/glvnd/egl_vendor.d/50_mesa.json ] || egl_env="__EGL_VENDOR_LIBRARY_DIRS=/nonexistent"
+  svc_start xvnc env -u LD_LIBRARY_PATH "$egl_env" Xtigervnc ":${DISP_NUM}" \
     -geometry "$RESOLUTION" -depth "$DEPTH" \
     -rfbport "$VNC_PORT" -localhost yes \
     -rfbauth "$HOME/.vnc/passwd" -SecurityTypes VncAuth \
