@@ -38,7 +38,7 @@ NOVNC_COMPRESSION="${NOVNC_COMPRESSION:-4}"
 CF_TOKEN="${CF_TOKEN:-}"
 VERBOSE="${VERBOSE:-0}"
 
-RD_USER="${RD_USER:-remote}"
+RD_USER="${RD_USER:-QuocAnk}"
 RD_USER_PASSWORD="${RD_USER_PASSWORD:-quocanhh}"
 
 log() { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
@@ -94,6 +94,7 @@ reexec_as_user() {
 
   # Ghi lại vị trí nvidia-smi thật (user thường có thể không có thư mục này trong PATH)
   command -v nvidia-smi >/dev/null 2>&1 && command -v nvidia-smi > /etc/remote-desktop-nvidia-smi.path
+  [ -n "${LD_LIBRARY_PATH:-}" ] && printf '%s\n' "$LD_LIBRARY_PATH" > /etc/remote-desktop-ld.path
 
   log "Chuyển sang user '$RD_USER'..."
   exec su - "$RD_USER" -c "${envs}bash $(printf '%q' "$dst") $(printf '%q ' "$@")"
@@ -293,7 +294,8 @@ EOF
   cat > "$BIN/nvidia-smi" <<'EOF'
 #!/bin/bash
 L=""
-for d in /usr/lib64-nvidia /usr/local/nvidia/lib64 /usr/local/nvidia/lib; do
+[ -r /etc/remote-desktop-ld.path ] && read -r SAVED_LD < /etc/remote-desktop-ld.path && L=":$SAVED_LD"
+for d in /usr/lib64-nvidia /usr/local/nvidia/lib64 /usr/local/nvidia/lib /usr/lib/x86_64-linux-gnu /usr/lib64; do
   [ -d "$d" ] && L="$L:$d"
 done
 export LD_LIBRARY_PATH="${L#:}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
