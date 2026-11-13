@@ -1,19 +1,16 @@
 #!/usr/bin/env bash
 # =====================================================================
 # ColabStream - Remote Desktop trong container (không systemd):
-#   Xvfb + JWM (Joe's Window Manager) + Selkies-GStreamer (WebRTC)
+#   Xvfb + JWM (Joe's Window Manager) + Selkies 2.x (AppImage, WebSocket)
 #   + Cloudflare Tunnel + thư viện GPU NVIDIA (Tesla T4) qua EGL / VirtualGL
-#   Video được mã hóa bằng NVENC (nvh264enc) nếu có GPU, ngược lại dùng x264enc.
+#
+# Selkies 2.x truyền hình qua WebSocket trên MỘT cổng duy nhất nên chạy được
+# qua Cloudflare Tunnel mà KHÔNG cần TURN server.
 #
 # Dùng:  ./ColabStream.sh user | install | install-selkies | install-gpu | start | stop | restart | status | url | gpu | logs [service]
 #
 # Nếu chạy bằng root, script tự tạo user có quyền sudo (mặc định "remote"),
 # rồi tự chuyển sang user đó để chạy lệnh (install, start, ...).
-#
-# LƯU Ý QUAN TRỌNG VỀ TURN:
-#   Selkies-GStreamer truyền hình qua WebRTC (UDP/TCP riêng), còn Cloudflare Tunnel
-#   chỉ chuyển được HTTP/WebSocket. Trang web sẽ mở được nhưng video thường KHÔNG
-#   kết nối nếu thiếu TURN server. Hãy đặt TURN_HOST/TURN_USER/TURN_PASS (xem bên dưới).
 #
 # Biến môi trường (tùy chọn):
 #   RD_USER          tên user sẽ tạo/chuyển sang (mặc định: remote)
@@ -25,12 +22,11 @@
 #   RESOLUTION       độ phân giải (mặc định 1280x720; nhỏ hơn = mượt hơn)
 #   DEPTH            độ sâu màu (mặc định 24)
 #   CF_TOKEN         token Cloudflare Tunnel đã đặt tên (nếu trống -> quick tunnel *.trycloudflare.com)
-#   SELKIES_PORT     cổng web/signaling của Selkies (mặc định 6080)
-#   SELKIES_ENCODER  bộ mã hóa: nvh264enc | x264enc | vp8enc ... (mặc định: tự chọn theo GPU)
-#   SELKIES_URL      link tải trực tiếp bản portable (ghi đè tự dò)
-#   SELKIES_VERSION  ví dụ 1.6.2 -> tải đúng bản đó từ github.com/selkies-project/selkies
-#   TURN_HOST / TURN_PORT / TURN_USER / TURN_PASS   thông tin TURN (giao thức TCP)
-#   XVFB_GLX=1       bật extension GLX trên Xvfb (mặc định 0: tắt để tránh crash do lib GL của NVIDIA)
+#   SELKIES_PORT     cổng web của Selkies (mặc định 6080)
+#   SELKIES_VERSION  phiên bản Selkies (mặc định 2.2.1), tải AppImage từ github.com/selkies-project/selkies
+#   SELKIES_URL      link tải AppImage trực tiếp (ghi đè SELKIES_VERSION)
+#   SELKIES_ENCODER  ép bộ mã hóa (ví dụ x264enc, jpeg...); để trống = Selkies tự chọn theo máy
+#   XVFB_GLX=0       tắt extension GLX trên Xvfb (mặc định 1: bật, VirtualGL/gpurun cần GLX phía server)
 #   VGL_VERSION      phiên bản VirtualGL (mặc định 3.1.1)
 #
 # Chạy ứng dụng bằng GPU:  gpurun <lệnh>      ví dụ:  gpurun glxgears
@@ -41,14 +37,10 @@ RESOLUTION="${RESOLUTION:-1280x720}"
 DEPTH="${DEPTH:-24}"
 DISP_NUM=1
 SELKIES_PORT="${SELKIES_PORT:-6080}"
-SELKIES_ENCODER="${SELKIES_ENCODER:-}"
+SELKIES_VERSION="${SELKIES_VERSION:-2.2.1}"
 SELKIES_URL="${SELKIES_URL:-}"
-SELKIES_VERSION="${SELKIES_VERSION:-}"
-TURN_HOST="${TURN_HOST:-}"
-TURN_PORT="${TURN_PORT:-3478}"
-TURN_USER="${TURN_USER:-}"
-TURN_PASS="${TURN_PASS:-}"
-XVFB_GLX="${XVFB_GLX:-0}"
+SELKIES_ENCODER="${SELKIES_ENCODER:-}"
+XVFB_GLX="${XVFB_GLX:-1}"
 CF_TOKEN="${CF_TOKEN:-}"
 VERBOSE="${VERBOSE:-0}"
 
@@ -104,7 +96,7 @@ reexec_as_user() {
   envs="export PATH=$(printf '%q' "$PATH"):\$PATH; "
   for v in STREAM_USER STREAM_PASSWORD VNC_PASSWORD RESOLUTION DEPTH CF_TOKEN \
            SELKIES_PORT SELKIES_ENCODER SELKIES_URL SELKIES_VERSION \
-           TURN_HOST TURN_PORT TURN_USER TURN_PASS XVFB_GLX VGL_VERSION VERBOSE; do
+           XVFB_GLX VGL_VERSION VERBOSE; do
     if [ -n "${!v-}" ]; then envs+="export $v=$(printf '%q' "${!v}"); "; fi
   done
 
@@ -186,43 +178,34 @@ install_all() {
 }
 
 # ---------------------------------------------------------------------
-# Tìm file chạy của Selkies sau khi giải nén (tên thư mục có thể khác theo bản phát hành)
+# Đường dẫn file chạy Selkies (AppImage đã giải nén, không cần FUSE)
 selkies_run_path() {
-  find "$SELKIES_DIR" -maxdepth 3 -type f -name 'selkies-gstreamer-run' 2>/dev/null | head -n1
+  [ -x "$SELKIES_DIR/squashfs-root/AppRun" ] && echo "$SELKIES_DIR/squashfs-root/AppRun"
 }
 
-# Tải bản portable (tarball chạy được trên mọi distro glibc >= 2.17, không cần root để chạy)
+# Tải AppImage Selkies 2.x rồi giải nén (container thường không có FUSE)
 install_selkies() {
   if [ -n "$(selkies_run_path)" ]; then
     log "      Selkies đã có: $(selkies_run_path)"
     return 0
   fi
-  if [ "$(uname -m)" != "x86_64" ]; then
-    err "Bản portable của Selkies chỉ hỗ trợ x86_64 trong script này."
-    return 1
-  fi
+  case "$(uname -m)" in
+    x86_64|aarch64) ;;
+    *) err "Kiến trúc $(uname -m) không có AppImage Selkies."; return 1 ;;
+  esac
 
   local url="$SELKIES_URL"
-  if [ -z "$url" ] && [ -n "$SELKIES_VERSION" ]; then
-    url="https://github.com/selkies-project/selkies/releases/download/v${SELKIES_VERSION}/selkies-gstreamer-portable-v${SELKIES_VERSION}_amd64.tar.gz"
-  fi
-  if [ -z "$url" ]; then
-    log "      Dò bản Selkies-GStreamer portable mới nhất trên GitHub..."
-    url="$(curl -fsSL 'https://api.github.com/repos/selkies-project/selkies/releases?per_page=20' 2>>"$INSTALL_LOG" \
-      | jq -r '[.[].assets[]?.browser_download_url | select(test("selkies-gstreamer-portable.*amd64\\.tar\\.gz$"))][0]' 2>>"$INSTALL_LOG")"
-  fi
-  if [ -z "$url" ] || [ "$url" = "null" ]; then
-    err "Không dò được link tải Selkies. Hãy đặt SELKIES_VERSION=<số phiên bản> hoặc SELKIES_URL=<link .tar.gz>."
-    return 1
-  fi
+  [ -n "$url" ] || url="https://github.com/selkies-project/selkies/releases/download/${SELKIES_VERSION}/selkies-${SELKIES_VERSION}-$(uname -m).AppImage"
 
-  local tgz="/tmp/selkies-portable.tar.gz"
-  run "      Tải Selkies: $url" curl -fL --retry 3 -o "$tgz" "$url" || return 1
-  run "      Giải nén Selkies" tar -xzf "$tgz" -C "$SELKIES_DIR" || { rm -f "$tgz"; return 1; }
-  rm -f "$tgz"
+  # Dọn bản cài lỗi trước đó (ví dụ tarball sai) rồi tải lại
+  rm -rf "$SELKIES_DIR"; mkdir -p "$SELKIES_DIR"
+  run "      Tải Selkies: $url" curl -fL --retry 3 -o "$SELKIES_DIR/selkies.AppImage" "$url" || return 1
+  chmod +x "$SELKIES_DIR/selkies.AppImage"
+  run "      Giải nén AppImage" bash -c "cd '$SELKIES_DIR' && ./selkies.AppImage --appimage-extract" || return 1
+  rm -f "$SELKIES_DIR/selkies.AppImage"
 
   if [ -z "$(selkies_run_path)" ]; then
-    err "Giải nén xong nhưng không thấy selkies-gstreamer-run trong $SELKIES_DIR. Kiểm tra: ls -R $SELKIES_DIR | head"
+    err "Giải nén xong nhưng không thấy squashfs-root/AppRun. Kiểm tra: ls $SELKIES_DIR"
     return 1
   fi
   log "      Đã cài Selkies: $(selkies_run_path)"
@@ -267,7 +250,7 @@ install_gpu() {
   log "GPU: $name | driver của host: $ver"
 
   run "      Cài thư viện OpenGL/EGL/Vulkan nền" $SUDO $APT install -y --no-install-recommends \
-    libglvnd0 libegl1 libgl1 libglx0 libgles2 libopengl0 \
+    libglvnd0 libegl1 libgl1 libglx0 libgles2 libopengl0 libgl1-mesa-dri libglx-mesa0 \
     libvulkan1 vulkan-tools mesa-utils wget kmod
 
   # 1) Thư viện userspace NVIDIA khớp đúng phiên bản driver của host (không cài kernel module)
@@ -334,17 +317,6 @@ gpu_check() {
       || echo "Không đọc được. Hãy chạy '$0 start' trước."
   else
     echo "Chưa có glxinfo (cài mesa-utils)."
-  fi
-}
-
-# Chọn bộ mã hóa: có NVENC (libnvidia-encode) thì dùng nvh264enc, ngược lại x264enc
-pick_encoder() {
-  if [ -n "$SELKIES_ENCODER" ]; then echo "$SELKIES_ENCODER"; return; fi
-  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1 \
-     && ldconfig -p | grep -q 'libnvidia-encode'; then
-    echo "nvh264enc"
-  else
-    echo "x264enc"
   fi
 }
 
@@ -415,8 +387,8 @@ EOF
 # Tạo các wrapper chạy từng dịch vụ (mỗi lần restart đều chạy lại wrapper => dọn lock cũ)
 make_wrappers() {
   # --- Xvfb ---
-  local glx_arg="-extension GLX"
-  [ "$XVFB_GLX" = "1" ] && glx_arg="+extension GLX"
+  local glx_arg="+extension GLX"
+  [ "$XVFB_GLX" = "0" ] && glx_arg="-extension GLX"
   cat > "$BIN/run-xvfb" <<EOF
 #!/bin/bash
 # Dọn lock/socket cũ trước MỖI lần (re)start để tránh chết liên tục
@@ -440,32 +412,24 @@ exec "$BASE/xstartup"
 EOF
   chmod +x "$BIN/run-desktop"
 
-  # --- Selkies-GStreamer ---
-  local srun sdir enc q_user q_pass turn_args=""
+  # --- Selkies 2.x (AppImage đã giải nén; chụp màn hình :1, phát qua WebSocket) ---
+  local srun q_user q_pass enc_env=""
   srun="$(selkies_run_path)"
-  sdir="$(dirname "$srun")"
-  enc="$(pick_encoder)"
   q_user="$(printf '%q' "$STREAM_USER")"
   q_pass="$(printf '%q' "$STREAM_PASSWORD")"
-  if [ -n "$TURN_HOST" ]; then
-    turn_args="$(printf '%q ' \
-      "--turn_host=$TURN_HOST" "--turn_port=$TURN_PORT" "--turn_protocol=tcp" \
-      "--turn_username=$TURN_USER" "--turn_password=$TURN_PASS")"
-  fi
+  [ -n "$SELKIES_ENCODER" ] && enc_env="export SELKIES_ENCODER=$(printf '%q' "$SELKIES_ENCODER")"
   cat > "$BIN/run-selkies" <<EOF
 #!/bin/bash
 export DISPLAY=:${DISP_NUM}
 export XDG_RUNTIME_DIR="/tmp/runtime-\$(id -u)"
 mkdir -p "\$XDG_RUNTIME_DIR"; chmod 700 "\$XDG_RUNTIME_DIR"
 export PULSE_SERVER="unix:\$XDG_RUNTIME_DIR/pulse/native"
+${enc_env}
 # Âm thanh (không bắt buộc; lỗi thì bỏ qua)
 pulseaudio --daemonize=yes --exit-idle-time=-1 >/dev/null 2>&1 || true
 for i in \$(seq 1 30); do [ -S /tmp/.X11-unix/X${DISP_NUM} ] && break; sleep 1; done
-cd "$sdir" || exit 1
-exec "$srun" --addr=0.0.0.0 --port=${SELKIES_PORT} \\
-  --enable_https=false --encoder=${enc} \\
-  --enable_basic_auth=true --basic_auth_user=${q_user} --basic_auth_password=${q_pass} \\
-  ${turn_args}
+exec "$srun" --public --port=${SELKIES_PORT} \\
+  --basic-auth-user=${q_user} --basic-auth-password=${q_pass}
 EOF
   chmod 700 "$BIN/run-selkies"   # chứa mật khẩu => chỉ user này đọc được
 }
@@ -518,12 +482,8 @@ start_all() {
   # 2) Desktop session JWM (chờ X sẵn sàng rồi mới chạy)
   svc_start desktop "$BIN/run-desktop"
 
-  # 3) Selkies-GStreamer (chụp màn hình :1, mã hóa, phát qua WebRTC)
+  # 3) Selkies 2.x (WebSocket, một cổng, không cần TURN)
   svc_start selkies "$BIN/run-selkies"
-  log "Bộ mã hóa video: $(pick_encoder)"
-  if [ -z "$TURN_HOST" ]; then
-    err "Chưa đặt TURN_HOST: qua Cloudflare Tunnel video có thể không kết nối (chỉ thấy trang đăng nhập/đen)."
-  fi
 
   # 4) Cloudflare tunnel
   if [ -n "$CF_TOKEN" ]; then
@@ -544,7 +504,7 @@ stop_all() {
   for s in cloudflared selkies desktop xvfb; do svc_stop "$s"; done
   pkill -u "$(id -u)" -f "Xvfb :${DISP_NUM}" 2>/dev/null
   pkill -u "$(id -u)" -x jwm 2>/dev/null
-  pkill -u "$(id -u)" -f "selkies-gstreamer" 2>/dev/null
+  pkill -u "$(id -u)" -f "$SELKIES_DIR" 2>/dev/null
   pkill -u "$(id -u)" -f "cloudflared tunnel" 2>/dev/null
   pulseaudio --kill >/dev/null 2>&1
   $SUDO rm -f "/tmp/.X${DISP_NUM}-lock" "/tmp/.X11-unix/X${DISP_NUM}"
