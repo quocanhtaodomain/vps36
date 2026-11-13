@@ -92,6 +92,9 @@ reexec_as_user() {
     if [ -n "${!v-}" ]; then envs+="export $v=$(printf '%q' "${!v}"); "; fi
   done
 
+  # Ghi lại vị trí nvidia-smi thật (user thường có thể không có thư mục này trong PATH)
+  command -v nvidia-smi >/dev/null 2>&1 && command -v nvidia-smi > /etc/remote-desktop-nvidia-smi.path
+
   log "Chuyển sang user '$RD_USER'..."
   exec su - "$RD_USER" -c "${envs}bash $(printf '%q' "$dst") $(printf '%q ' "$@")"
 }
@@ -284,19 +287,37 @@ fi
 EOF
   chmod +x "$BIN/gpurun"
   $SUDO ln -sf "$BIN/gpurun" /usr/local/bin/gpurun 2>/dev/null || true
+
+  # nvidia-smi: tự thêm thư mục thư viện NVIDIA của host (Colab: /usr/lib64-nvidia)
+  # chỉ cho riêng lệnh này, không đụng LD_LIBRARY_PATH toàn hệ thống (tránh crash Xtigervnc)
+  cat > "$BIN/nvidia-smi" <<'EOF'
+#!/bin/bash
+L=""
+for d in /usr/lib64-nvidia /usr/local/nvidia/lib64 /usr/local/nvidia/lib; do
+  [ -d "$d" ] && L="$L:$d"
+done
+export LD_LIBRARY_PATH="${L#:}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+[ -r /etc/remote-desktop-nvidia-smi.path ] && read -r SAVED < /etc/remote-desktop-nvidia-smi.path
+for b in "${SAVED:-}" /opt/bin/nvidia-smi /usr/local/nvidia/bin/nvidia-smi /usr/bin/nvidia-smi /usr/lib64-nvidia/bin/nvidia-smi; do
+  [ -x "$b" ] && exec "$b" "$@"
+done
+echo "Không tìm thấy nvidia-smi" >&2; exit 1
+EOF
+  chmod +x "$BIN/nvidia-smi"
 }
 
 install_gpu() {
-  if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L >/dev/null 2>&1; then
+  make_gpurun
+  local NVSMI="$BIN/nvidia-smi"
+  if ! "$NVSMI" -L >/dev/null 2>&1; then
     err "Không phát hiện GPU NVIDIA (nvidia-smi không chạy được) - bỏ qua phần GPU."
     err "Nếu dùng Colab: Runtime > Change runtime type > chọn T4 GPU."
-    make_gpurun
     return 0
   fi
 
   local ver name major
-  ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1 | tr -d ' ')"
-  name="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n1)"
+  ver="$("$NVSMI" --query-gpu=driver_version --format=csv,noheader | head -n1 | tr -d ' ')"
+  name="$("$NVSMI" --query-gpu=name --format=csv,noheader | head -n1)"
   major="${ver%%.*}"
   log "GPU: $name | driver của host: $ver"
 
@@ -357,7 +378,7 @@ install_gpu() {
 
 gpu_check() {
   echo "=== nvidia-smi ==="
-  nvidia-smi 2>&1 | head -n 15 || err "nvidia-smi lỗi"
+  "$BIN/nvidia-smi" 2>&1 | head -n 15
   echo
   echo "=== Thư viện NVIDIA ==="
   ldconfig -p | grep -E 'libEGL_nvidia|libGLX_nvidia|libcuda\.so' || echo "(không thấy)"
@@ -382,7 +403,7 @@ prepare_config() {
   chmod 600 "$HOME/.vnc/passwd"
   echo "$VNC_PASSWORD" > "$BASE/password.txt"; chmod 600 "$BASE/password.txt"
 
-  [ -x "$BIN/gpurun" ] || make_gpurun
+  make_gpurun
   [ -x "$BIN/polymc" ] || make_app_wrappers
 
   # Cấu hình JWM (chỉ tạo nếu chưa có; xóa ~/.jwmrc để tạo lại mặc định)
